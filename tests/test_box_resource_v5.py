@@ -22,7 +22,7 @@ class BoxResourceV5Tests(unittest.TestCase):
             {
                 "size": 8 * GIB,
                 "progress": 0.0,
-                "state": "stalledDL",
+                "state": "pausedDL",
                 "downloaded": 0,
                 "uploaded": 0,
                 "dlspeed": 0,
