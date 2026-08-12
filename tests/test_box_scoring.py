@@ -1,12 +1,15 @@
 import unittest
 from datetime import timedelta
 
+from app.box_decision import watch_retry_delay
 from app.box_service import score_torrent
-from app.box_service_v2 import is_junk_rss_title, watch_retry_delay
+from app.box_service_v2 import is_junk_rss_title
 from app.timeutil import now
 
 
 class BoxScoringTests(unittest.TestCase):
+    """保留第一版基础评分回归；新趋势策略见 test_box_decision.py。"""
+
     def setUp(self):
         self.cfg = {
             "min_size_gb": 0.3,
@@ -53,9 +56,9 @@ class BoxScoringTests(unittest.TestCase):
         self.assertFalse(is_junk_rss_title("Trying S05E06 1080p WEB-DL"))
 
     def test_watch_retry_gets_slower_as_torrent_ages(self):
-        self.assertEqual(watch_retry_delay(30), 120)
-        self.assertEqual(watch_retry_delay(180), 180)
-        self.assertEqual(watch_retry_delay(500), 300)
+        self.assertEqual(watch_retry_delay(30), 45)
+        self.assertEqual(watch_retry_delay(180), 60)
+        self.assertEqual(watch_retry_delay(500), 120)
 
 
 if __name__ == "__main__":
