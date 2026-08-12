@@ -2,13 +2,13 @@ import hashlib
 import time
 
 from app.box_config import load_box_config, load_box_state, save_box_state
+from app.box_decision import add_observation, evaluate_torrent, watch_retry_delay
 from app.box_service import (
     BoxController,
     _safe_filename,
     _torrent_bytes,
     disk_snapshot,
     fetch_rss,
-    score_torrent,
     traffic_snapshot,
 )
 from app.mteam import client as mteam_client
@@ -42,17 +42,38 @@ def is_junk_rss_title(title: str) -> bool:
     return False
 
 
-def watch_retry_delay(age_seconds: int) -> int:
-    age = max(0, int(age_seconds or 0))
-    if age < 120:
-        return 120
-    if age < 300:
-        return 180
-    return 300
+def _decision_row(tid: str, title: str, meta: dict, verdict: dict) -> dict:
+    trend = verdict.get("trend") or {}
+    return {
+        "torrent_id": tid,
+        "name": meta.get("name") or title or tid,
+        "size_gb": meta.get("size_gb"),
+        "seeders": meta.get("seeders"),
+        "leechers": meta.get("leechers"),
+        "age_seconds": verdict.get("age_seconds"),
+        "demand": verdict.get("demand"),
+        "score": verdict.get("score"),
+        "priority": verdict.get("priority"),
+        "required_score": verdict.get("required_score"),
+        "trend": trend,
+        "trend_summary": trend.get("summary") or "",
+        "reason": " · ".join(verdict.get("reasons") or []),
+    }
+
+
+def _candidate_sort_key(candidate: dict):
+    verdict = candidate.get("verdict") or {}
+    meta = candidate.get("meta") or {}
+    return (
+        float(verdict.get("priority") or -999),
+        float(verdict.get("score") or 0),
+        float(verdict.get("demand") or 0),
+        -float(meta.get("size_gb") or 0),
+    )
 
 
 class BoxControllerV2(BoxController):
-    """在原盒子控制器上增加 RSS 暖机、垃圾种预过滤与观察退避。"""
+    """趋势感知盒子控制器：RSS 暖机、垃圾过滤、候选池排序、后起量救援。"""
 
     def run_once(self) -> dict:
         cfg = load_box_config()
@@ -68,8 +89,7 @@ class BoxControllerV2(BoxController):
         source_fp = rss_source_fingerprint(rss_url)
         feed_items = feed.get("items") or []
 
-        # 首次启用 / RSS 地址变化：只登记当前列表为基线，不逐条查询详情。
-        # 这样不会把几十条历史种当成刚发现的新种，也不会白白消耗 detail 请求。
+        # 第一次启用 / RSS 变化：只把现有项目登记为基线。
         if not state.get("rss_warmed_up") or state.get("rss_source_fp") != source_fp:
             seen = set(str(x) for x in (state.get("seen_ids") or []))
             baseline_ids = [str(x.get("id") or "") for x in feed_items if str(x.get("id") or "")]
@@ -78,6 +98,7 @@ class BoxControllerV2(BoxController):
             state["rss_warmed_up"] = True
             state["rss_source_fp"] = source_fp
             state["watch_retry_at"] = {}
+            state["torrent_observations"] = {}
             state["last_run_at"] = now_str()
             state["last_error"] = ""
             self._decision(state, {
@@ -120,14 +141,17 @@ class BoxControllerV2(BoxController):
 
         seen = set(str(x) for x in (state.get("seen_ids") or []))
         retry_at = dict(state.get("watch_retry_at") or {})
+        observations = dict(state.get("torrent_observations") or {})
         max_items = max(1, min(100, int(cfg.get("max_rss_items_per_run") or 30)))
         processed = 0
         added = []
         pending = []
         rejected = []
+        candidates = []
         skipped_backoff = 0
         now_ts = int(time.time())
 
+        # 第一阶段：把本轮所有该看的新种都看完，形成候选池；不在循环里抢先下载。
         for item in feed_items[:max_items]:
             tid = str(item.get("id") or "")
             if not tid or tid in seen:
@@ -137,6 +161,7 @@ class BoxControllerV2(BoxController):
             if is_junk_rss_title(title):
                 seen.add(tid)
                 retry_at.pop(tid, None)
+                observations.pop(tid, None)
                 rejected.append(tid)
                 self._decision(state, {
                     "torrent_id": tid,
@@ -156,64 +181,40 @@ class BoxControllerV2(BoxController):
             try:
                 detail = mteam_client.torrent_detail(tid)
                 meta = mteam_client._torrent_meta(detail)
-                verdict = score_torrent(meta, cfg)
-                row = {
-                    "torrent_id": tid,
-                    "name": meta.get("name") or title or tid,
-                    "size_gb": meta.get("size_gb"),
-                    "seeders": meta.get("seeders"),
-                    "leechers": meta.get("leechers"),
-                    "age_seconds": verdict.get("age_seconds"),
-                    "demand": verdict.get("demand"),
-                    "score": verdict.get("score"),
-                    "reason": " · ".join(verdict.get("reasons") or []),
-                }
-                if not verdict.get("accepted"):
-                    row["result"] = "reject" if verdict.get("permanent") else "watch"
-                    self._decision(state, row)
-                    if verdict.get("permanent"):
-                        seen.add(tid)
-                        retry_at.pop(tid, None)
-                        rejected.append(tid)
-                    else:
-                        delay = watch_retry_delay(verdict.get("age_seconds") or 0)
-                        retry_at[tid] = now_ts + delay
-                        pending.append(tid)
-                    continue
-
-                qitems = qb.torrents(tagged_only=True)
-                traffic = traffic_snapshot(cfg, state=state, persist=True)
-                state = load_box_state()
-                disk = disk_snapshot(cfg)
-                allowed, why = self._resource_gate(meta, cfg, qitems, traffic, disk)
-                if not allowed:
-                    row["result"] = "wait-resource"
-                    row["reason"] = (row.get("reason") or "") + " · " + why
-                    self._decision(state, row)
-                    retry_at[tid] = now_ts + 180
-                    pending.append(tid)
-                    if traffic.get("budget_reached"):
-                        break
-                    continue
-
-                content = _torrent_bytes(tid)
-                qb.add_torrent(content, _safe_filename(tid, meta.get("name") or tid))
-                seen.add(tid)
-                retry_at.pop(tid, None)
-                row["result"] = "added"
-                self._decision(state, row)
-                added.append(tid)
-                append_download_log(
-                    f"盒子抢流已推送 qBittorrent id={tid} score={verdict.get('score')} "
-                    f"size={meta.get('size_gb')}GB S/L={meta.get('seeders')}/{meta.get('leechers')}",
-                    action="box_add",
-                    torrent_id=tid,
-                    name=meta.get("name") or "",
-                    score=verdict.get("score"),
-                    size_gb=meta.get("size_gb"),
-                    seeders=meta.get("seeders"),
-                    leechers=meta.get("leechers"),
+                history = add_observation(
+                    observations.get(tid) or [],
+                    int(meta.get("seeders") or 0),
+                    int(meta.get("leechers") or 0),
+                    now_ts,
                 )
+                observations[tid] = history
+                verdict = evaluate_torrent(meta, cfg, history=history)
+                row = _decision_row(tid, title, meta, verdict)
+
+                if verdict.get("permanent"):
+                    row["result"] = "reject"
+                    self._decision(state, row)
+                    seen.add(tid)
+                    retry_at.pop(tid, None)
+                    observations.pop(tid, None)
+                    rejected.append(tid)
+                    continue
+
+                if not verdict.get("accepted"):
+                    row["result"] = "watch"
+                    self._decision(state, row)
+                    delay = watch_retry_delay(verdict.get("age_seconds") or 0, verdict.get("trend"))
+                    retry_at[tid] = now_ts + delay
+                    pending.append(tid)
+                    continue
+
+                candidates.append({
+                    "tid": tid,
+                    "title": title,
+                    "meta": meta,
+                    "verdict": verdict,
+                    "row": row,
+                })
             except Exception as e:
                 self._decision(state, {
                     "torrent_id": tid,
@@ -224,8 +225,82 @@ class BoxControllerV2(BoxController):
                 retry_at[tid] = now_ts + 300
                 pending.append(tid)
 
+        # 第二阶段：统一按“超过动态门槛的余量 + 需求 + 趋势”排序，再分配有限下载槽。
+        candidates.sort(key=_candidate_sort_key, reverse=True)
+        summary = QBittorrentClient.summary(qitems)
+        max_active = max(1, int(cfg.get("max_active_downloads") or 1))
+        slots = max(0, max_active - int(summary.get("active_downloads") or 0))
+        projected_disk = dict(disk)
+
+        for rank, candidate in enumerate(candidates, 1):
+            tid = candidate["tid"]
+            meta = candidate["meta"]
+            verdict = candidate["verdict"]
+            row = dict(candidate["row"])
+            row["rank"] = rank
+            row["candidate_count"] = len(candidates)
+
+            if slots <= 0:
+                row["result"] = "standby"
+                row["reason"] += f" · 本轮候选排名 #{rank}/{len(candidates)}，下载槽已被更优候选占用"
+                self._decision(state, row)
+                retry_at[tid] = now_ts + 60
+                pending.append(tid)
+                continue
+
+            allowed, why = self._resource_gate(meta, cfg, qitems, traffic, projected_disk)
+            if not allowed:
+                row["result"] = "wait-resource"
+                row["reason"] += " · " + why
+                self._decision(state, row)
+                retry_at[tid] = now_ts + 180
+                pending.append(tid)
+                if traffic.get("budget_reached"):
+                    slots = 0
+                continue
+
+            try:
+                content = _torrent_bytes(tid)
+                qb.add_torrent(content, _safe_filename(tid, meta.get("name") or tid))
+                seen.add(tid)
+                retry_at.pop(tid, None)
+                observations.pop(tid, None)
+                row["result"] = "added"
+                row["reason"] += f" · 本轮候选 #{rank}/{len(candidates)}，优先级 {verdict.get('priority')}"
+                self._decision(state, row)
+                added.append(tid)
+                slots -= 1
+                projected_disk["free_gb"] = max(
+                    0.0,
+                    float(projected_disk.get("free_gb") or 0) - float(meta.get("size_gb") or 0),
+                )
+                if slots > 0:
+                    qitems = qb.torrents(tagged_only=True)
+                append_download_log(
+                    f"盒子抢流已推送 qBittorrent id={tid} score={verdict.get('score')} "
+                    f"priority={verdict.get('priority')} size={meta.get('size_gb')}GB "
+                    f"S/L={meta.get('seeders')}/{meta.get('leechers')} rank={rank}/{len(candidates)}",
+                    action="box_add",
+                    torrent_id=tid,
+                    name=meta.get("name") or "",
+                    score=verdict.get("score"),
+                    priority=verdict.get("priority"),
+                    size_gb=meta.get("size_gb"),
+                    seeders=meta.get("seeders"),
+                    leechers=meta.get("leechers"),
+                    rank=rank,
+                    candidate_count=len(candidates),
+                )
+            except Exception as e:
+                row["result"] = "error"
+                row["reason"] += f" · 推送失败：{str(e)[:180]}"
+                self._decision(state, row)
+                retry_at[tid] = now_ts + 300
+                pending.append(tid)
+
         state["seen_ids"] = list(seen)
         state["watch_retry_at"] = retry_at
+        state["torrent_observations"] = observations
         state["rss_warmed_up"] = True
         state["rss_source_fp"] = source_fp
         state["last_run_at"] = now_str()
@@ -234,11 +309,12 @@ class BoxControllerV2(BoxController):
 
         cleanup = self.cleanup() if cfg.get("auto_cleanup") else {"deleted": []}
         append_pt_log(
-            f"盒子 RSS 扫描 feed={feed.get('title') or '-'} processed={processed} added={len(added)} "
-            f"watch={len(pending)} reject={len(rejected)} backoff={skipped_backoff} "
+            f"盒子 RSS 扫描 feed={feed.get('title') or '-'} processed={processed} candidates={len(candidates)} "
+            f"added={len(added)} watch={len(pending)} reject={len(rejected)} backoff={skipped_backoff} "
             f"cleanup={len(cleanup.get('deleted') or [])}",
             action="box_scan",
             processed=processed,
+            candidates=len(candidates),
             added=added,
             pending=pending[:20],
             rejected=rejected[:20],
@@ -248,6 +324,7 @@ class BoxControllerV2(BoxController):
             "ok": True,
             "feed": feed.get("title") or "",
             "processed": processed,
+            "candidates": len(candidates),
             "added": added,
             "pending": pending,
             "rejected": rejected,
