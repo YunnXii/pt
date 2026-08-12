@@ -70,6 +70,8 @@ class BoxControllerV6(BoxControllerV5):
 
         feed = fetch_rss(rss_url)
         seen = set(str(x) for x in (state.get("seen_ids") or []))
+        retry_at = dict(state.get("watch_retry_at") or {})
+        now_ts = int(time.time())
         max_probe = max(1, min(10, int(cfg.get("race_candidates_per_run") or 3)))
         race_min = max(float(cfg.get("min_size_gb") or 0), float(cfg.get("race_min_size_gb") or 0.3))
         race_max_cfg = float(cfg.get("race_max_size_gb") or 2.0)
@@ -90,6 +92,9 @@ class BoxControllerV6(BoxControllerV5):
                 break
             tid = str(item.get("id") or "")
             if not tid or tid in seen:
+                continue
+            # 已经被 Trend 看过并安排了下一次复查的候选，不再由 Race 重复消耗 detail。
+            if int(retry_at.get(tid) or 0) > now_ts:
                 continue
             title = str(item.get("title") or "")
             if is_junk_rss_title(title):
@@ -165,9 +170,9 @@ class BoxControllerV6(BoxControllerV5):
             seen = set(str(x) for x in (state.get("seen_ids") or []))
             seen.add(tid)
             state["seen_ids"] = list(seen)
-            (state.get("watch_retry_at") or {}).pop(tid, None)
-            (state.get("torrent_observations") or {}).pop(tid, None)
-            (state.get("resource_wait_queue") or {}).pop(tid, None)
+            state.setdefault("watch_retry_at", {}).pop(tid, None)
+            state.setdefault("torrent_observations", {}).pop(tid, None)
+            state.setdefault("resource_wait_queue", {}).pop(tid, None)
 
             name = meta.get("name") or candidate["title"] or tid
             row = {
