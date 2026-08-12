@@ -66,19 +66,28 @@ class BoxControllerV4(BoxControllerV3):
                 continue
             old = queue.get(tid) if isinstance(queue.get(tid), dict) else {}
             first_wait = int(old.get("first_wait_at") or now_ts)
+            # 旧 wait-resource 第一次迁移进独立队列时必须“立即可复查”。
+            # 否则同一轮 drain 会因为 next_retry_at=now+60 而跳过，随后 RSS 又被
+            # watch_retry_at 退避，用户只会看到一屏“退避跳过”。已有队列项则保留
+            # 自己的下一次复查时间，最多不会被推迟超过一个 recheck 周期。
+            if old:
+                next_retry_at = min(
+                    int(old.get("next_retry_at") or now_ts),
+                    now_ts + recheck,
+                )
+            else:
+                next_retry_at = now_ts
             queue[tid] = {
                 "name": str(row.get("name") or old.get("name") or tid)[:180],
                 "first_wait_at": first_wait,
-                "last_wait_at": now_ts,
-                "next_retry_at": min(
-                    int(old.get("next_retry_at") or (now_ts + recheck)),
-                    now_ts + recheck,
-                ),
+                "last_wait_at": int(old.get("last_wait_at") or now_ts),
+                "next_retry_at": next_retry_at,
                 "score": float(row.get("score") or old.get("score") or 0),
                 "priority": float(row.get("priority") or old.get("priority") or 0),
                 "size_gb": float(row.get("size_gb") or old.get("size_gb") or 0),
                 "reason": str(row.get("reason") or old.get("reason") or "资源不足")[:300],
             }
+            # 主 RSS 暂时不要重复处理这只种；独立资源队列不受这个时间限制。
             retry_at[tid] = max(int(retry_at.get(tid) or 0), now_ts + recheck)
             if not old:
                 added += 1
@@ -135,7 +144,7 @@ class BoxControllerV4(BoxControllerV3):
         queue = dict(state.get("resource_wait_queue") or {})
         if not queue:
             save_box_state(state)
-            return {"checked": 0, "added": [], "remaining": 0, "skipped_resource": 0}
+            return {"checked": 0, "added": [], "remaining": 0, "skipped_resource": 0, "deferred": 0}
 
         qb = QBittorrentClient(cfg)
         qitems = qb.torrents(tagged_only=True)
@@ -154,6 +163,7 @@ class BoxControllerV4(BoxControllerV3):
         checked = 0
         added = []
         skipped_resource = 0
+        deferred = 0
 
         for tid, queued in sorted(queue.items(), key=_queue_sort_key, reverse=True):
             if checked >= max_checks:
@@ -163,6 +173,7 @@ class BoxControllerV4(BoxControllerV3):
                 retry_at.pop(tid, None)
                 continue
             if int(queued.get("next_retry_at") or 0) > now_ts:
+                deferred += 1
                 continue
 
             # 先用队列里已有的 size 做廉价资源判断。仍然明显塞不下时不要浪费 detail 配额。
@@ -308,6 +319,7 @@ class BoxControllerV4(BoxControllerV3):
             "added": added,
             "remaining": len(queue),
             "skipped_resource": skipped_resource,
+            "deferred": deferred,
         }
 
     def run_once(self) -> dict:
