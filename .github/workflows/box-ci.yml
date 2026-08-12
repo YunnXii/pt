@@ -10,7 +10,7 @@ on:
       - "app/qbittorrent.py"
       - "static/box-integrated.js"
       - "static/box-integrated.css"
-      - "tests/test_box_scoring.py"
+      - "tests/test_box_*.py"
       - ".github/workflows/box-ci.yml"
 
 jobs:
@@ -27,5 +27,5 @@ jobs:
         run: python -m compileall -q app tests
       - name: Check integrated frontend syntax
         run: node --check static/box-integrated.js
-      - name: Box scoring tests
-        run: python -m unittest tests.test_box_scoring
+      - name: Box decision tests
+        run: python -m unittest discover -s tests -p 'test_box_*.py' -v
