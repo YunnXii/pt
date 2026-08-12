@@ -42,6 +42,9 @@ DEFAULT_BOX_CONFIG = {
     "cleanup_ratio": 2.85,
     "cleanup_idle_minutes": 360,
     "cleanup_min_seed_minutes": 1440,
+    # 下载卡死清理：0B 僵尸更快清理；已有部分数据则给更长恢复时间。
+    "cleanup_stalled_zero_minutes": 15,
+    "cleanup_stalled_partial_minutes": 30,
     "max_rss_items_per_run": 30,
 }
 
@@ -51,6 +54,8 @@ DEFAULT_BOX_STATE = {
     "rss_source_fp": "",
     "watch_retry_at": {},
     "torrent_observations": {},
+    # hash -> downloaded / first_seen_at / last_progress_at，用于判断未完成下载是否真正停止推进。
+    "download_progress_state": {},
     "traffic_cycle_key": "",
     "traffic_baseline_bytes": None,
     "last_run_at": "",
@@ -116,6 +121,21 @@ def save_box_state(state: dict) -> dict:
         out["torrent_observations"] = compact
     else:
         out["torrent_observations"] = {}
+
+    progress_state = out.get("download_progress_state") or {}
+    if isinstance(progress_state, dict):
+        compact_progress = {}
+        for h, row in list(progress_state.items())[-200:]:
+            if isinstance(row, dict):
+                compact_progress[str(h)] = {
+                    "downloaded": int(row.get("downloaded") or 0),
+                    "first_seen_at": int(row.get("first_seen_at") or 0),
+                    "last_progress_at": int(row.get("last_progress_at") or 0),
+                    "state": str(row.get("state") or ""),
+                }
+        out["download_progress_state"] = compact_progress
+    else:
+        out["download_progress_state"] = {}
 
     with _lock:
         BOX_STATE_FILE.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
