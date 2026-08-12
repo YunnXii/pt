@@ -31,6 +31,8 @@ class BoxConfigIn(BaseModel):
     qbit_tag: Optional[str] = None
     qbit_category: Optional[str] = None
     download_dir: Optional[str] = None
+    vnstat_interface: Optional[str] = None
+
     min_size_gb: Optional[float] = None
     max_size_gb: Optional[float] = None
     max_age_seconds: Optional[int] = None
@@ -39,19 +41,40 @@ class BoxConfigIn(BaseModel):
     max_seeders: Optional[int] = None
     min_demand: Optional[float] = None
     min_score: Optional[float] = None
+
+    race_lane_enabled: Optional[bool] = None
+    race_min_size_gb: Optional[float] = None
+    race_tier1_max_size_gb: Optional[float] = None
+    race_tier1_max_age_seconds: Optional[int] = None
+    race_tier2_max_size_gb: Optional[float] = None
+    race_tier2_max_age_seconds: Optional[int] = None
+    race_tier3_max_size_gb: Optional[float] = None
+    race_tier3_max_age_seconds: Optional[int] = None
+    race_candidates_per_run: Optional[int] = None
+
     max_active_downloads: Optional[int] = None
     data_cap_gb: Optional[float] = None
     disk_reserve_gb: Optional[float] = None
     traffic_budget_gb: Optional[float] = None
     traffic_hard_stop_gb: Optional[float] = None
     billing_reset_day: Optional[int] = None
+
     detail_limit_per_hour: Optional[int] = None
     download_limit_per_hour: Optional[int] = None
-    vnstat_interface: Optional[str] = None
+
     auto_cleanup: Optional[bool] = None
     cleanup_ratio: Optional[float] = None
     cleanup_idle_minutes: Optional[int] = None
     cleanup_min_seed_minutes: Optional[int] = None
+    cleanup_stalled_zero_minutes: Optional[int] = None
+    cleanup_stalled_partial_minutes: Optional[int] = None
+
+    resource_queue_recheck_seconds: Optional[int] = None
+    resource_queue_checks_per_run: Optional[int] = None
+    resource_queue_max_items: Optional[int] = None
+    resource_queue_hard_max_age_seconds: Optional[int] = None
+
+    experiment_enabled: Optional[bool] = None
     max_rss_items_per_run: Optional[int] = None
 
 
@@ -68,6 +91,16 @@ def box_page():
 @router.get("/api/box/config")
 def box_get_config(user: str = Depends(auth_user)):
     return masked_box_config(load_box_config())
+
+
+def _clamp_int(data: dict, key: str, low: int, high: int):
+    if key in data:
+        data[key] = max(low, min(high, int(data[key])))
+
+
+def _clamp_float(data: dict, key: str, low: float, high: float):
+    if key in data:
+        data[key] = max(low, min(high, float(data[key])))
 
 
 @router.post("/api/box/config")
@@ -91,24 +124,51 @@ def box_update_config(body: BoxConfigIn, user: str = Depends(auth_user)):
     elif pwd == "":
         data.pop("qbit_password", None)
 
-    if "rss_poll_seconds" in data:
-        data["rss_poll_seconds"] = max(20, int(data["rss_poll_seconds"]))
-    if "billing_reset_day" in data:
-        data["billing_reset_day"] = max(1, min(31, int(data["billing_reset_day"])))
-    if "max_active_downloads" in data:
-        data["max_active_downloads"] = max(1, int(data["max_active_downloads"]))
-    if "max_rss_items_per_run" in data:
-        data["max_rss_items_per_run"] = max(1, min(100, int(data["max_rss_items_per_run"])))
-    if "max_age_seconds" in data:
-        data["max_age_seconds"] = max(300, int(data["max_age_seconds"]))
+    _clamp_int(data, "rss_poll_seconds", 20, 3600)
+    _clamp_int(data, "billing_reset_day", 1, 31)
+    _clamp_int(data, "max_active_downloads", 1, 20)
+    _clamp_int(data, "max_rss_items_per_run", 1, 100)
+    _clamp_int(data, "max_age_seconds", 60, 86400)
+    _clamp_int(data, "hard_max_age_seconds", 300, 172800)
+    _clamp_int(data, "detail_limit_per_hour", 1, 100)
+    _clamp_int(data, "download_limit_per_hour", 1, 100)
+    _clamp_int(data, "race_candidates_per_run", 1, 20)
+    _clamp_int(data, "race_tier1_max_age_seconds", 20, 3600)
+    _clamp_int(data, "race_tier2_max_age_seconds", 20, 3600)
+    _clamp_int(data, "race_tier3_max_age_seconds", 20, 3600)
+    _clamp_int(data, "cleanup_idle_minutes", 1, 10080)
+    _clamp_int(data, "cleanup_min_seed_minutes", 0, 43200)
+    _clamp_int(data, "cleanup_stalled_zero_minutes", 1, 1440)
+    _clamp_int(data, "cleanup_stalled_partial_minutes", 1, 2880)
+    _clamp_int(data, "resource_queue_recheck_seconds", 20, 3600)
+    _clamp_int(data, "resource_queue_checks_per_run", 1, 20)
+    _clamp_int(data, "resource_queue_max_items", 10, 500)
+    _clamp_int(data, "resource_queue_hard_max_age_seconds", 300, 172800)
+
+    for key in (
+        "min_size_gb", "max_size_gb", "race_min_size_gb",
+        "race_tier1_max_size_gb", "race_tier2_max_size_gb", "race_tier3_max_size_gb",
+        "data_cap_gb", "disk_reserve_gb", "traffic_budget_gb", "traffic_hard_stop_gb",
+    ):
+        _clamp_float(data, key, 0.0, 100000.0)
+    _clamp_float(data, "min_demand", 0.0, 1000.0)
+    _clamp_float(data, "min_score", -1000.0, 1000.0)
+    _clamp_float(data, "cleanup_ratio", 0.0, 1000.0)
+
+    # Race 三档按体积递增，避免前端误填出相互覆盖的区间。
+    t1 = float(data.get("race_tier1_max_size_gb", cfg.get("race_tier1_max_size_gb") or 2.0))
+    t2 = float(data.get("race_tier2_max_size_gb", cfg.get("race_tier2_max_size_gb") or 4.0))
+    t3 = float(data.get("race_tier3_max_size_gb", cfg.get("race_tier3_max_size_gb") or 6.0))
+    if not (t1 <= t2 <= t3):
+        raise HTTPException(400, "Race 分档体积必须满足：第一档 ≤ 第二档 ≤ 第三档")
+
+    soft = int(data.get("max_age_seconds", cfg.get("max_age_seconds") or 900))
     if "hard_max_age_seconds" in data:
-        data["hard_max_age_seconds"] = max(600, int(data["hard_max_age_seconds"]))
-        soft = int(data.get("max_age_seconds") or cfg.get("max_age_seconds") or 900)
-        data["hard_max_age_seconds"] = max(soft, data["hard_max_age_seconds"])
-    if "detail_limit_per_hour" in data:
-        data["detail_limit_per_hour"] = max(1, min(100, int(data["detail_limit_per_hour"])))
-    if "download_limit_per_hour" in data:
-        data["download_limit_per_hour"] = max(1, min(100, int(data["download_limit_per_hour"])))
+        data["hard_max_age_seconds"] = max(soft, int(data["hard_max_age_seconds"]))
+    qhard = int(data.get("resource_queue_hard_max_age_seconds", cfg.get("resource_queue_hard_max_age_seconds") or 7200))
+    data["resource_queue_hard_max_age_seconds"] = max(
+        int(data.get("hard_max_age_seconds", cfg.get("hard_max_age_seconds") or 3600)), qhard
+    )
 
     cfg.update(data)
     cfg = save_box_config(cfg)
