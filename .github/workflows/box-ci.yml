@@ -8,7 +8,7 @@ on:
     paths:
       - "app/box_*.py"
       - "app/qbittorrent.py"
-      - "static/box-integrated.js"
+      - "static/box-*.js"
       - "static/box-integrated.css"
       - "tests/test_box_*.py"
       - ".github/workflows/box-ci.yml"
@@ -25,7 +25,9 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile Python
         run: python -m compileall -q app tests
-      - name: Check integrated frontend syntax
-        run: node --check static/box-integrated.js
+      - name: Check box frontend syntax
+        run: |
+          node --check static/box-integrated.js
+          node --check static/box-decision-ui.js
       - name: Box decision tests
         run: python -m unittest discover -s tests -p 'test_box_*.py' -v
