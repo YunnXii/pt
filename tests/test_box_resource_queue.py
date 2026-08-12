@@ -34,7 +34,7 @@ class BoxResourceQueueTests(unittest.TestCase):
         ]
         self.assertNotIn("1", _latest_wait_resource_rows(decisions))
 
-    def test_sync_migrates_wait_resource_and_delays_rss_duplicate(self):
+    def test_sync_migrates_wait_resource_immediately_and_delays_rss_duplicate(self):
         state = {
             "seen_ids": [],
             "resource_wait_queue": {},
@@ -54,7 +54,40 @@ class BoxResourceQueueTests(unittest.TestCase):
         added = self.controller._sync_resource_queue_from_decisions(state, self.cfg, 1000)
         self.assertEqual(added, 1)
         self.assertIn("99", state["resource_wait_queue"])
+        # 独立资源队列首次迁移必须本轮立即可复查。
+        self.assertEqual(state["resource_wait_queue"]["99"]["next_retry_at"], 1000)
+        # 但主 RSS 仍需退避，避免同一只 torrent 被两条路径重复查询。
         self.assertGreaterEqual(state["watch_retry_at"]["99"], 1060)
+
+    def test_existing_queue_keeps_future_retry(self):
+        state = {
+            "seen_ids": [],
+            "resource_wait_queue": {
+                "99": {
+                    "name": "Hot Torrent",
+                    "first_wait_at": 900,
+                    "last_wait_at": 950,
+                    "next_retry_at": 1030,
+                    "score": 112,
+                    "priority": 62,
+                    "size_gb": 0.6,
+                }
+            },
+            "watch_retry_at": {},
+            "decisions": [
+                {
+                    "torrent_id": "99",
+                    "name": "Hot Torrent",
+                    "result": "wait-resource",
+                    "score": 112,
+                    "priority": 62,
+                    "size_gb": 0.6,
+                }
+            ],
+        }
+        added = self.controller._sync_resource_queue_from_decisions(state, self.cfg, 1000)
+        self.assertEqual(added, 0)
+        self.assertEqual(state["resource_wait_queue"]["99"]["next_retry_at"], 1030)
 
     def test_queue_priority_prefers_hotter_candidate(self):
         low = ("a", {"priority": 20, "score": 100, "size_gb": 1.0, "first_wait_at": 100})
