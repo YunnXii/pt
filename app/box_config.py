@@ -10,7 +10,7 @@ _lock = Lock()
 DEFAULT_BOX_CONFIG = {
     "enabled": False,
     "rss_url": "",
-    "rss_poll_seconds": 60,
+    "rss_poll_seconds": 90,
     "qbit_url": "http://127.0.0.1:8080",
     "qbit_username": "admin",
     "qbit_password": "",
@@ -18,13 +18,13 @@ DEFAULT_BOX_CONFIG = {
     "qbit_category": "mteam-box",
     "download_dir": "/srv/torrents/downloads",
     "vnstat_interface": "eth0",
-    "min_size_gb": 0.5,
-    "max_size_gb": 6.0,
-    "max_age_seconds": 600,
-    "min_leechers": 1,
-    "max_seeders": 50,
-    "min_demand": 0.25,
-    "min_score": 45.0,
+    "min_size_gb": 0.3,
+    "max_size_gb": 9.0,
+    "max_age_seconds": 900,
+    "min_leechers": 4,
+    "max_seeders": 25,
+    "min_demand": 0.5,
+    "min_score": 65.0,
     "max_active_downloads": 1,
     "data_cap_gb": 16.0,
     "disk_reserve_gb": 4.0,
@@ -33,13 +33,16 @@ DEFAULT_BOX_CONFIG = {
     "billing_reset_day": 1,
     "auto_cleanup": True,
     "cleanup_ratio": 2.85,
-    "cleanup_idle_minutes": 60,
-    "cleanup_min_seed_minutes": 20,
+    "cleanup_idle_minutes": 360,
+    "cleanup_min_seed_minutes": 1440,
     "max_rss_items_per_run": 30,
 }
 
 DEFAULT_BOX_STATE = {
     "seen_ids": [],
+    "rss_warmed_up": False,
+    "rss_source_fp": "",
+    "watch_retry_at": {},
     "traffic_cycle_key": "",
     "traffic_baseline_bytes": None,
     "last_run_at": "",
@@ -89,6 +92,11 @@ def save_box_state(state: dict) -> dict:
     out = _merge(DEFAULT_BOX_STATE, state)
     out["seen_ids"] = [str(x) for x in (out.get("seen_ids") or [])][-2000:]
     out["decisions"] = list(out.get("decisions") or [])[-100:]
+    retry = out.get("watch_retry_at") or {}
+    if isinstance(retry, dict):
+        out["watch_retry_at"] = dict(list(retry.items())[-500:])
+    else:
+        out["watch_retry_at"] = {}
     with _lock:
         BOX_STATE_FILE.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     return out
