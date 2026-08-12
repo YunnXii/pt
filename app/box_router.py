@@ -45,6 +45,8 @@ class BoxConfigIn(BaseModel):
     traffic_budget_gb: Optional[float] = None
     traffic_hard_stop_gb: Optional[float] = None
     billing_reset_day: Optional[int] = None
+    detail_limit_per_hour: Optional[int] = None
+    download_limit_per_hour: Optional[int] = None
     vnstat_interface: Optional[str] = None
     auto_cleanup: Optional[bool] = None
     cleanup_ratio: Optional[float] = None
@@ -103,6 +105,10 @@ def box_update_config(body: BoxConfigIn, user: str = Depends(auth_user)):
         data["hard_max_age_seconds"] = max(600, int(data["hard_max_age_seconds"]))
         soft = int(data.get("max_age_seconds") or cfg.get("max_age_seconds") or 900)
         data["hard_max_age_seconds"] = max(soft, data["hard_max_age_seconds"])
+    if "detail_limit_per_hour" in data:
+        data["detail_limit_per_hour"] = max(1, min(100, int(data["detail_limit_per_hour"])))
+    if "download_limit_per_hour" in data:
+        data["download_limit_per_hour"] = max(1, min(100, int(data["download_limit_per_hour"])))
 
     cfg.update(data)
     cfg = save_box_config(cfg)
