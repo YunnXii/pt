@@ -34,6 +34,7 @@ class BoxConfigIn(BaseModel):
     min_size_gb: Optional[float] = None
     max_size_gb: Optional[float] = None
     max_age_seconds: Optional[int] = None
+    hard_max_age_seconds: Optional[int] = None
     min_leechers: Optional[int] = None
     max_seeders: Optional[int] = None
     min_demand: Optional[float] = None
@@ -96,6 +97,12 @@ def box_update_config(body: BoxConfigIn, user: str = Depends(auth_user)):
         data["max_active_downloads"] = max(1, int(data["max_active_downloads"]))
     if "max_rss_items_per_run" in data:
         data["max_rss_items_per_run"] = max(1, min(100, int(data["max_rss_items_per_run"])))
+    if "max_age_seconds" in data:
+        data["max_age_seconds"] = max(300, int(data["max_age_seconds"]))
+    if "hard_max_age_seconds" in data:
+        data["hard_max_age_seconds"] = max(600, int(data["hard_max_age_seconds"]))
+        soft = int(data.get("max_age_seconds") or cfg.get("max_age_seconds") or 900)
+        data["hard_max_age_seconds"] = max(soft, data["hard_max_age_seconds"])
 
     cfg.update(data)
     cfg = save_box_config(cfg)
