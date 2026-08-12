@@ -10,7 +10,7 @@ _lock = Lock()
 DEFAULT_BOX_CONFIG = {
     "enabled": False,
     "rss_url": "",
-    "rss_poll_seconds": 90,
+    "rss_poll_seconds": 45,
     "qbit_url": "http://127.0.0.1:8080",
     "qbit_username": "admin",
     "qbit_password": "",
@@ -20,8 +20,12 @@ DEFAULT_BOX_CONFIG = {
     "vnstat_interface": "eth0",
     "min_size_gb": 0.3,
     "max_size_gb": 9.0,
+    # 软黄金窗口：超过后仍可被高需求/强趋势救回来。
     "max_age_seconds": 900,
+    # 绝对观察上限：超过才永久放弃。
+    "hard_max_age_seconds": 3600,
     "min_leechers": 4,
+    # Seeder 仅作为竞争参考上限，不再直接永久拒绝。
     "max_seeders": 25,
     "min_demand": 0.5,
     "min_score": 65.0,
@@ -43,6 +47,7 @@ DEFAULT_BOX_STATE = {
     "rss_warmed_up": False,
     "rss_source_fp": "",
     "watch_retry_at": {},
+    "torrent_observations": {},
     "traffic_cycle_key": "",
     "traffic_baseline_bytes": None,
     "last_run_at": "",
@@ -91,12 +96,24 @@ def save_box_state(state: dict) -> dict:
     ensure_dirs()
     out = _merge(DEFAULT_BOX_STATE, state)
     out["seen_ids"] = [str(x) for x in (out.get("seen_ids") or [])][-2000:]
-    out["decisions"] = list(out.get("decisions") or [])[-100:]
+    out["decisions"] = list(out.get("decisions") or [])[-120:]
+
     retry = out.get("watch_retry_at") or {}
     if isinstance(retry, dict):
         out["watch_retry_at"] = dict(list(retry.items())[-500:])
     else:
         out["watch_retry_at"] = {}
+
+    observations = out.get("torrent_observations") or {}
+    if isinstance(observations, dict):
+        compact = {}
+        for tid, rows in list(observations.items())[-500:]:
+            if isinstance(rows, list):
+                compact[str(tid)] = [x for x in rows if isinstance(x, dict)][-12:]
+        out["torrent_observations"] = compact
+    else:
+        out["torrent_observations"] = {}
+
     with _lock:
         BOX_STATE_FILE.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     return out
