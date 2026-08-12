@@ -13,7 +13,7 @@ box_router_module.controller = box_controller
 app.include_router(box_router_module.router)
 
 # app.main 原本直接 FileResponse static/index.html。
-# 盒子版入口只在运行时注入一份 CSS/JS，不复制整套主页面，也不破坏原前端。
+# 盒子版入口只在运行时注入 CSS/JS，不复制整套主页面，也不破坏原前端。
 for _route in list(app.router.routes):
     if getattr(_route, "path", None) == "/" and "GET" in (getattr(_route, "methods", None) or set()):
         app.router.routes.remove(_route)
@@ -23,8 +23,11 @@ for _route in list(app.router.routes):
 @app.get("/", include_in_schema=False)
 def _integrated_index():
     html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-    css = '<link rel="stylesheet" href="/static/box-integrated.css?v=2" />'
-    js = '<script src="/static/box-integrated.js?v=2"></script>'
+    css = '<link rel="stylesheet" href="/static/box-integrated.css?v=3" />'
+    js = (
+        '<script src="/static/box-integrated.js?v=3"></script>\n'
+        '<script src="/static/box-decision-ui.js?v=1"></script>'
+    )
     html = html.replace("</head>", css + "\n</head>", 1)
     html = html.replace("</body>", js + "\n</body>", 1)
     return HTMLResponse(html, headers={"Cache-Control": "no-store"})
