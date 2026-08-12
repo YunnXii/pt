@@ -4,7 +4,7 @@ from fastapi.responses import HTMLResponse
 
 from app.main import app
 import app.box_router as box_router_module
-from app.box_service_v4 import controller as box_controller
+from app.box_service_v5 import controller as box_controller
 
 ROOT = Path(__file__).resolve().parent.parent
 
