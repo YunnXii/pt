@@ -49,6 +49,14 @@ DEFAULT_BOX_CONFIG = {
     "resource_queue_recheck_seconds": 60,
     "resource_queue_checks_per_run": 3,
     "resource_queue_max_items": 120,
+    "resource_queue_hard_max_age_seconds": 7200,
+    # Race Lane：小体积新种不等 Leecher，直接抢入场时间；与 trend 策略做真实对照。
+    "race_lane_enabled": True,
+    "race_max_age_seconds": 180,
+    "race_min_size_gb": 0.3,
+    "race_max_size_gb": 2.0,
+    "race_candidates_per_run": 3,
+    "experiment_enabled": True,
     "max_rss_items_per_run": 30,
 }
 
@@ -62,6 +70,8 @@ DEFAULT_BOX_STATE = {
     "resource_wait_queue": {},
     # hash -> downloaded / first_seen_at / last_progress_at，用于判断未完成下载是否真正停止推进。
     "download_progress_state": {},
+    # hash/torrent id -> race/trend 入场与 1/3/5/10 分钟战绩。
+    "experiments": {},
     "traffic_cycle_key": "",
     "traffic_baseline_bytes": None,
     "last_run_at": "",
@@ -162,6 +172,34 @@ def save_box_state(state: dict) -> dict:
         out["download_progress_state"] = compact_progress
     else:
         out["download_progress_state"] = {}
+
+    experiments = out.get("experiments") or {}
+    if isinstance(experiments, dict):
+        compact_experiments = {}
+        for key, row in list(experiments.items())[-300:]:
+            if not isinstance(row, dict):
+                continue
+            milestones = row.get("milestones") or {}
+            compact_experiments[str(key)] = {
+                "torrent_id": str(row.get("torrent_id") or ""),
+                "qbit_hash": str(row.get("qbit_hash") or ""),
+                "name": str(row.get("name") or "")[:220],
+                "strategy": str(row.get("strategy") or "unknown"),
+                "added_at": int(row.get("added_at") or 0),
+                "size_gb": float(row.get("size_gb") or 0),
+                "entry_age_seconds": int(row.get("entry_age_seconds") or 0),
+                "entry_seeders": int(row.get("entry_seeders") or 0),
+                "entry_leechers": int(row.get("entry_leechers") or 0),
+                "entry_score": float(row.get("entry_score") or 0),
+                "milestones": {
+                    str(k): dict(v) for k, v in milestones.items()
+                    if str(k) in ("m1", "m3", "m5", "m10") and isinstance(v, dict)
+                },
+                "latest": dict(row.get("latest") or {}),
+            }
+        out["experiments"] = compact_experiments
+    else:
+        out["experiments"] = {}
 
     with _lock:
         BOX_STATE_FILE.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
