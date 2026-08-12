@@ -45,6 +45,10 @@ DEFAULT_BOX_CONFIG = {
     # 下载卡死清理：0B 僵尸更快清理；已有部分数据则给更长恢复时间。
     "cleanup_stalled_zero_minutes": 15,
     "cleanup_stalled_partial_minutes": 30,
+    # 资源等待队列：即使种子滚出 RSS，也会在空间/下载槽释放后重新评估。
+    "resource_queue_recheck_seconds": 60,
+    "resource_queue_checks_per_run": 3,
+    "resource_queue_max_items": 120,
     "max_rss_items_per_run": 30,
 }
 
@@ -54,6 +58,8 @@ DEFAULT_BOX_STATE = {
     "rss_source_fp": "",
     "watch_retry_at": {},
     "torrent_observations": {},
+    # torrent id -> 等待原因/上次分数/下次复查时间；独立于 RSS 当前窗口持久化。
+    "resource_wait_queue": {},
     # hash -> downloaded / first_seen_at / last_progress_at，用于判断未完成下载是否真正停止推进。
     "download_progress_state": {},
     "traffic_cycle_key": "",
@@ -121,6 +127,26 @@ def save_box_state(state: dict) -> dict:
         out["torrent_observations"] = compact
     else:
         out["torrent_observations"] = {}
+
+    queue = out.get("resource_wait_queue") or {}
+    if isinstance(queue, dict):
+        compact_queue = {}
+        for tid, row in list(queue.items())[-200:]:
+            if not isinstance(row, dict):
+                continue
+            compact_queue[str(tid)] = {
+                "name": str(row.get("name") or "")[:180],
+                "first_wait_at": int(row.get("first_wait_at") or 0),
+                "last_wait_at": int(row.get("last_wait_at") or 0),
+                "next_retry_at": int(row.get("next_retry_at") or 0),
+                "score": float(row.get("score") or 0),
+                "priority": float(row.get("priority") or 0),
+                "size_gb": float(row.get("size_gb") or 0),
+                "reason": str(row.get("reason") or "")[:300],
+            }
+        out["resource_wait_queue"] = compact_queue
+    else:
+        out["resource_wait_queue"] = {}
 
     progress_state = out.get("download_progress_state") or {}
     if isinstance(progress_state, dict):
