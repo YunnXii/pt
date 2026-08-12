@@ -8,6 +8,7 @@ from app.store import DATA_DIR, append_pt_log, ensure_dirs
 
 
 BOX_API_BUDGET_FILE = DATA_DIR / "box_api_budget.json"
+LEGACY_MIGRATION_DETAIL_RESERVE = 40
 _budget_lock = Lock()
 
 
@@ -47,10 +48,16 @@ def rolling_window_usage(timestamps: list, limit: int, now_ts: int = None) -> di
     }
 
 
-def _load_budget_file() -> dict:
+def _load_budget_file(now_ts: int = None) -> dict:
     ensure_dirs()
     if not BOX_API_BUDGET_FILE.exists():
-        return {"detail": [], "download": []}
+        # 本功能是从旧版全局 40/h 迁移而来。首次启用时保守假定过去一小时
+        # 已有 40 次 detail，避免重启后“新预算从 0 开始”瞬间叠加到站点限额上。
+        now_ts = int(now_ts if now_ts is not None else time.time())
+        return {
+            "detail": [now_ts] * LEGACY_MIGRATION_DETAIL_RESERVE,
+            "download": [],
+        }
     try:
         data = json.loads(BOX_API_BUDGET_FILE.read_text(encoding="utf-8")) or {}
         return {
@@ -75,7 +82,7 @@ def reserve_api_call(kind: str, limit: int, now_ts: int = None) -> dict:
         raise ValueError(f"未知盒子 API 配额类型: {kind}")
     now_ts = int(now_ts if now_ts is not None else time.time())
     with _budget_lock:
-        data = _load_budget_file()
+        data = _load_budget_file(now_ts=now_ts)
         usage = rolling_window_usage(data.get(kind) or [], limit, now_ts)
         if usage["remaining"] <= 0:
             # 顺手把过期时间戳清掉，保持文件紧凑。
@@ -94,10 +101,10 @@ def box_api_budget_snapshot(cfg: dict, now_ts: int = None) -> dict:
     detail_limit = max(1, int(cfg.get("detail_limit_per_hour") or 90))
     download_limit = max(1, int(cfg.get("download_limit_per_hour") or 80))
     with _budget_lock:
-        data = _load_budget_file()
+        data = _load_budget_file(now_ts=now_ts)
         detail = rolling_window_usage(data.get("detail") or [], detail_limit, now_ts)
         download = rolling_window_usage(data.get("download") or [], download_limit, now_ts)
-        # 读取状态时也清理过期项，但不新增调用。
+        # 读取状态时也清理过期项，并把首次迁移缓冲正式写入磁盘。
         data["detail"] = detail["timestamps"]
         data["download"] = download["timestamps"]
         _save_budget_file(data)
