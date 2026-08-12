@@ -3,10 +3,15 @@ import time
 
 from app.box_config import load_box_config, load_box_state, save_box_state
 from app.box_decision import add_observation, evaluate_torrent, watch_retry_delay
+from app.box_mteam import (
+    BoxApiBudgetError,
+    box_api_budget_snapshot,
+    box_torrent_bytes,
+    box_torrent_detail,
+)
 from app.box_service import (
     BoxController,
     _safe_filename,
-    _torrent_bytes,
     disk_snapshot,
     fetch_rss,
     traffic_snapshot,
@@ -72,6 +77,20 @@ def _candidate_sort_key(candidate: dict):
     )
 
 
+def _watch_sort_key(item: dict, observations: dict):
+    """当 detail 配额紧张时：已起量候选 > 全新未观察 > 已多次 0/0 的冷候选。"""
+    tid = str(item.get("id") or "")
+    history = observations.get(tid) or []
+    if not history:
+        return (3, 0.0, 0, 0)
+    last = history[-1] if isinstance(history[-1], dict) else {}
+    seeders = max(0, int(last.get("seeders") or 0))
+    leechers = max(0, int(last.get("leechers") or 0))
+    demand = leechers / (seeders + 1)
+    bucket = 4 if leechers > 0 else 1
+    return (bucket, demand, leechers, int(last.get("ts") or 0))
+
+
 class BoxControllerV2(BoxController):
     """趋势感知盒子控制器：RSS 暖机、垃圾过滤、候选池排序、后起量救援。"""
 
@@ -120,6 +139,7 @@ class BoxControllerV2(BoxController):
                 "added": [],
                 "pending": [],
                 "rejected": [],
+                "api_budget": box_api_budget_snapshot(cfg),
                 "message": f"RSS 暖机完成，登记 {len(baseline_ids)} 条现有项目；后续只处理新出现的种子",
             }
 
@@ -137,7 +157,7 @@ class BoxControllerV2(BoxController):
             state["last_run_at"] = now_str()
             state["last_error"] = ""
             save_box_state(state)
-            return {"ok": True, "hard_stop": True, "message": msg}
+            return {"ok": True, "hard_stop": True, "message": msg, "api_budget": box_api_budget_snapshot(cfg)}
 
         seen = set(str(x) for x in (state.get("seen_ids") or []))
         retry_at = dict(state.get("watch_retry_at") or {})
@@ -149,10 +169,22 @@ class BoxControllerV2(BoxController):
         rejected = []
         candidates = []
         skipped_backoff = 0
+        skipped_api_budget = 0
         now_ts = int(time.time())
 
+        api_before = box_api_budget_snapshot(cfg, now_ts=now_ts)
+        detail_remaining = int((api_before.get("detail") or {}).get("remaining") or 0)
+        download_remaining = int((api_before.get("download") or {}).get("remaining") or 0)
+
+        # 配额紧张时优先检查已经起量的 watch；全新种其次；持续 0/0 的冷候选最后。
+        ordered_items = sorted(
+            feed_items[:max_items],
+            key=lambda item: _watch_sort_key(item, observations),
+            reverse=True,
+        )
+
         # 第一阶段：把本轮所有该看的新种都看完，形成候选池；不在循环里抢先下载。
-        for item in feed_items[:max_items]:
+        for item in ordered_items:
             tid = str(item.get("id") or "")
             if not tid or tid in seen:
                 continue
@@ -177,9 +209,14 @@ class BoxControllerV2(BoxController):
                 skipped_backoff += 1
                 continue
 
+            if detail_remaining <= 0:
+                skipped_api_budget += 1
+                break
+
             processed += 1
+            detail_remaining -= 1
             try:
-                detail = mteam_client.torrent_detail(tid)
+                detail = box_torrent_detail(tid, cfg)
                 meta = mteam_client._torrent_meta(detail)
                 history = add_observation(
                     observations.get(tid) or [],
@@ -215,6 +252,11 @@ class BoxControllerV2(BoxController):
                     "verdict": verdict,
                     "row": row,
                 })
+            except BoxApiBudgetError:
+                detail_remaining = 0
+                skipped_api_budget += 1
+                processed = max(0, processed - 1)
+                break
             except Exception as e:
                 self._decision(state, {
                     "torrent_id": tid,
@@ -248,6 +290,14 @@ class BoxControllerV2(BoxController):
                 pending.append(tid)
                 continue
 
+            if download_remaining <= 0:
+                row["result"] = "wait-api"
+                row["reason"] += " · 盒子种子下载独立配额已用完，等待滚动窗口释放"
+                self._decision(state, row)
+                retry_at[tid] = now_ts + 120
+                pending.append(tid)
+                continue
+
             allowed, why = self._resource_gate(meta, cfg, qitems, traffic, projected_disk)
             if not allowed:
                 row["result"] = "wait-resource"
@@ -259,8 +309,9 @@ class BoxControllerV2(BoxController):
                     slots = 0
                 continue
 
+            download_remaining -= 1
             try:
-                content = _torrent_bytes(tid)
+                content = box_torrent_bytes(tid, cfg)
                 qb.add_torrent(content, _safe_filename(tid, meta.get("name") or tid))
                 seen.add(tid)
                 retry_at.pop(tid, None)
@@ -291,6 +342,13 @@ class BoxControllerV2(BoxController):
                     rank=rank,
                     candidate_count=len(candidates),
                 )
+            except BoxApiBudgetError as e:
+                download_remaining = 0
+                row["result"] = "wait-api"
+                row["reason"] += f" · {e}"
+                self._decision(state, row)
+                retry_at[tid] = now_ts + 120
+                pending.append(tid)
             except Exception as e:
                 row["result"] = "error"
                 row["reason"] += f" · 推送失败：{str(e)[:180]}"
@@ -308,9 +366,12 @@ class BoxControllerV2(BoxController):
         save_box_state(state)
 
         cleanup = self.cleanup() if cfg.get("auto_cleanup") else {"deleted": []}
+        api_after = box_api_budget_snapshot(cfg)
         append_pt_log(
             f"盒子 RSS 扫描 feed={feed.get('title') or '-'} processed={processed} candidates={len(candidates)} "
             f"added={len(added)} watch={len(pending)} reject={len(rejected)} backoff={skipped_backoff} "
+            f"api_skip={skipped_api_budget} detail={api_after['detail']['used']}/{api_after['detail']['limit']} "
+            f"download={api_after['download']['used']}/{api_after['download']['limit']} "
             f"cleanup={len(cleanup.get('deleted') or [])}",
             action="box_scan",
             processed=processed,
@@ -319,6 +380,8 @@ class BoxControllerV2(BoxController):
             pending=pending[:20],
             rejected=rejected[:20],
             skipped_backoff=skipped_backoff,
+            skipped_api_budget=skipped_api_budget,
+            api_budget=api_after,
         )
         return {
             "ok": True,
@@ -329,10 +392,20 @@ class BoxControllerV2(BoxController):
             "pending": pending,
             "rejected": rejected,
             "skipped_backoff": skipped_backoff,
+            "skipped_api_budget": skipped_api_budget,
             "cleanup": cleanup,
             "traffic": traffic,
             "disk": disk,
+            "api_budget": api_after,
         }
+
+    def status(self) -> dict:
+        out = super().status()
+        try:
+            out["api_budget"] = box_api_budget_snapshot(load_box_config())
+        except Exception as e:
+            out["api_budget"] = {"error": str(e)}
+        return out
 
 
 controller = BoxControllerV2()
