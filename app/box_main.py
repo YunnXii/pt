@@ -27,7 +27,8 @@ def _integrated_index():
     js = (
         '<script src="/static/box-integrated.js?v=3"></script>\n'
         '<script src="/static/box-decision-ui.js?v=1"></script>\n'
-        '<script src="/static/box-race-ui.js?v=1"></script>'
+        '<script src="/static/box-race-ui.js?v=1"></script>\n'
+        '<script src="/static/box-settings.js?v=1"></script>'
     )
     html = html.replace("</head>", css + "\n</head>", 1)
     html = html.replace("</body>", js + "\n</body>", 1)
