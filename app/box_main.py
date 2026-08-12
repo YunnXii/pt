@@ -4,7 +4,7 @@ from fastapi.responses import HTMLResponse
 
 from app.main import app
 import app.box_router as box_router_module
-from app.box_service_v5 import controller as box_controller
+from app.box_service_v6 import controller as box_controller
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -26,7 +26,8 @@ def _integrated_index():
     css = '<link rel="stylesheet" href="/static/box-integrated.css?v=3" />'
     js = (
         '<script src="/static/box-integrated.js?v=3"></script>\n'
-        '<script src="/static/box-decision-ui.js?v=1"></script>'
+        '<script src="/static/box-decision-ui.js?v=1"></script>\n'
+        '<script src="/static/box-race-ui.js?v=1"></script>'
     )
     html = html.replace("</head>", css + "\n</head>", 1)
     html = html.replace("</body>", js + "\n</body>", 1)
