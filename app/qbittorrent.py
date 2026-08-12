@@ -1,3 +1,4 @@
+import time
 from typing import Iterable
 
 import httpx
@@ -5,6 +6,11 @@ import httpx
 
 class QBittorrentError(RuntimeError):
     pass
+
+
+# 按“地址 + 用户名 + 密码”做短时退避。这样旧密码失败时不会被状态轮询连续轰炸，
+# 用户改成新密码后又可以立即重试，不必等退避时间结束。
+_AUTH_BACKOFF = {}
 
 
 class QBittorrentClient:
@@ -20,17 +26,50 @@ class QBittorrentClient:
     def _client(self) -> httpx.Client:
         return httpx.Client(timeout=30.0, follow_redirects=True)
 
+    def _auth_key(self):
+        return (self.base, self.username, self.password)
+
+    def _set_backoff(self, seconds: int, reason: str):
+        _AUTH_BACKOFF[self._auth_key()] = (time.monotonic() + max(1, int(seconds)), reason)
+
+    def _clear_backoff(self):
+        _AUTH_BACKOFF.pop(self._auth_key(), None)
+
     def _login(self, c: httpx.Client):
+        if not self.password:
+            raise QBittorrentError(
+                "qBittorrent 密码尚未配置；为避免 WebUI 连续失败触发 IP 封禁，已跳过登录"
+            )
+
+        blocked = _AUTH_BACKOFF.get(self._auth_key())
+        if blocked:
+            until, reason = blocked
+            left = int(until - time.monotonic())
+            if left > 0:
+                raise QBittorrentError(f"{reason}；{left}s 后自动允许重试，修改账号/密码可立即重试")
+            self._clear_backoff()
+
         r = c.post(
             self.base + "/api/v2/auth/login",
             data={"username": self.username, "password": self.password},
             headers={"Referer": self.base + "/"},
         )
+        if r.status_code == 403:
+            msg = (
+                "qBittorrent 登录 HTTP 403：当前请求 IP 已因连续登录失败被 WebUI 临时封禁。"
+                "先停止重复测试，重启 qBittorrent 可立即清除本次内存封禁，再用正确账号密码重试"
+            )
+            self._set_backoff(300, msg)
+            raise QBittorrentError(msg)
         if r.status_code >= 400:
+            self._set_backoff(60, f"qBittorrent 登录 HTTP {r.status_code}")
             raise QBittorrentError(f"qBittorrent 登录 HTTP {r.status_code}")
         text = (r.text or "").strip().lower()
         if text not in ("ok.", "ok"):
-            raise QBittorrentError("qBittorrent 登录失败，请检查 WebUI 用户名/密码")
+            msg = "qBittorrent 登录失败，请检查 WebUI 用户名/密码"
+            self._set_backoff(60, msg)
+            raise QBittorrentError(msg)
+        self._clear_backoff()
 
     def _request(self, method: str, path: str, **kwargs):
         with self._client() as c:
