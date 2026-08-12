@@ -1,4 +1,4 @@
-from typing import Iterable, Optional
+from typing import Iterable
 
 import httpx
 
@@ -41,6 +41,20 @@ class QBittorrentClient:
                 raise QBittorrentError(f"qBittorrent HTTP {r.status_code}: {body}")
             return r
 
+    def _ensure_labels(self):
+        """qBittorrent 不同版本对不存在的分类/标签处理不完全一致，先显式创建。"""
+        with self._client() as c:
+            self._login(c)
+            if self.tag:
+                r = c.post(self.base + "/api/v2/torrents/createTags", data={"tags": self.tag})
+                if r.status_code not in (200, 409):
+                    raise QBittorrentError(f"创建 qBittorrent 标签失败 HTTP {r.status_code}: {(r.text or '')[:200]}")
+            if self.category:
+                data = {"category": self.category, "savePath": self.download_dir or ""}
+                r = c.post(self.base + "/api/v2/torrents/createCategory", data=data)
+                if r.status_code not in (200, 409):
+                    raise QBittorrentError(f"创建 qBittorrent 分类失败 HTTP {r.status_code}: {(r.text or '')[:200]}")
+
     def test(self) -> dict:
         with self._client() as c:
             self._login(c)
@@ -61,6 +75,7 @@ class QBittorrentClient:
     def add_torrent(self, torrent_bytes: bytes, filename: str = "mteam.torrent") -> dict:
         if not torrent_bytes or len(torrent_bytes) < 50:
             raise QBittorrentError("种子内容为空或无效")
+        self._ensure_labels()
         data = {
             "paused": "false",
             "skip_checking": "false",
