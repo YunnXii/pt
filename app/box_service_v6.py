@@ -12,13 +12,29 @@ from app.store import append_download_log
 from app.timeutil import now
 
 
-class BoxControllerV6(BoxControllerV5):
-    """V5 + Race Lane + race/trend 战绩对照。
+def race_age_limit_for_size(size_gb: float, cfg: dict) -> int:
+    """返回该体积在 Race Lane 中允许的最大种龄；0 表示不走 Race。"""
+    size = max(0.0, float(size_gb or 0))
+    minimum = max(0.0, float(cfg.get("race_min_size_gb") or 0.3))
+    if size < minimum:
+        return 0
 
-    Race Lane 只做最基本的硬过滤，不等待 Leecher / demand / score：
-    在 RSS 首次看到仍很新的小种时，优先抢入场时间。Trend 车道继续由 V2/V5
-    的趋势模型负责，二者的实际 Ratio 会持续记录用于 A/B 对比。
-    """
+    tiers = (
+        (float(cfg.get("race_tier1_max_size_gb") or 2.0), int(cfg.get("race_tier1_max_age_seconds") or 180)),
+        (float(cfg.get("race_tier2_max_size_gb") or 4.0), int(cfg.get("race_tier2_max_age_seconds") or 150)),
+        (float(cfg.get("race_tier3_max_size_gb") or 6.0), int(cfg.get("race_tier3_max_age_seconds") or 90)),
+    )
+    global_max = float(cfg.get("max_size_gb") or 0)
+    if global_max > 0 and size > global_max:
+        return 0
+    for max_size, max_age in tiers:
+        if size <= max_size:
+            return max(20, max_age)
+    return 0
+
+
+class BoxControllerV6(BoxControllerV5):
+    """V5 + tiered Race Lane + race/trend 战绩对照。"""
 
     def _collect_experiments(self, cfg: dict = None) -> dict:
         cfg = cfg or load_box_config()
@@ -70,14 +86,9 @@ class BoxControllerV6(BoxControllerV5):
 
         feed = fetch_rss(rss_url)
         seen = set(str(x) for x in (state.get("seen_ids") or []))
-        retry_at = dict(state.get("watch_retry_at") or {})
-        now_ts = int(time.time())
-        max_probe = max(1, min(10, int(cfg.get("race_candidates_per_run") or 3)))
-        race_min = max(float(cfg.get("min_size_gb") or 0), float(cfg.get("race_min_size_gb") or 0.3))
-        race_max_cfg = float(cfg.get("race_max_size_gb") or 2.0)
-        global_max = float(cfg.get("max_size_gb") or 0)
-        race_max = min(race_max_cfg, global_max) if global_max > 0 else race_max_cfg
-        race_age = max(30, int(cfg.get("race_max_age_seconds") or 180))
+        retry_at = state.get("watch_retry_at") or {}
+        observations = state.get("torrent_observations") or {}
+        max_probe = max(1, min(20, int(cfg.get("race_candidates_per_run") or 6)))
 
         api = box_api_budget_snapshot(cfg)
         detail_remaining = int((api.get("detail") or {}).get("remaining") or 0)
@@ -93,8 +104,8 @@ class BoxControllerV6(BoxControllerV5):
             tid = str(item.get("id") or "")
             if not tid or tid in seen:
                 continue
-            # 已经被 Trend 看过并安排了下一次复查的候选，不再由 Race 重复消耗 detail。
-            if int(retry_at.get(tid) or 0) > now_ts:
+            # 已经进入 Trend/watch 的旧候选不再让 Race 重复探测；Race 只抢第一次出现的新 ID。
+            if tid in retry_at or tid in observations:
                 continue
             title = str(item.get("title") or "")
             if is_junk_rss_title(title):
@@ -113,15 +124,15 @@ class BoxControllerV6(BoxControllerV5):
             size_gb = float(meta.get("size_gb") or 0)
             created = _parse_created(meta.get("created_date") or "")
             age_seconds = max(0, int((now() - created).total_seconds())) if created else 999999
-            if size_gb <= 0 or size_gb < race_min or size_gb > race_max:
-                continue
-            if age_seconds > race_age:
+            allowed_age = race_age_limit_for_size(size_gb, cfg)
+            if allowed_age <= 0 or age_seconds > allowed_age:
                 continue
             eligible.append({
                 "tid": tid,
                 "title": title,
                 "meta": meta,
                 "age_seconds": age_seconds,
+                "allowed_age": allowed_age,
                 "size_gb": size_gb,
             })
 
@@ -130,15 +141,15 @@ class BoxControllerV6(BoxControllerV5):
                 "enabled": True,
                 "added": [],
                 "checked": probed,
-                "reason": f"本轮没有 {race_min:.1f}~{race_max:.1f}GB 且 ≤{race_age}s 的新种",
+                "reason": "本轮没有命中 Race 分档年龄×体积条件的新种",
             }
 
-        # 用户要求“最新的直接开下”：按真实发布时间年龄最小优先，不按 L/score 排序。
         eligible.sort(key=lambda x: (int(x.get("age_seconds") or 999999), float(x.get("size_gb") or 999)))
         candidate = eligible[0]
         tid = candidate["tid"]
         meta = candidate["meta"]
         age_seconds = candidate["age_seconds"]
+        allowed_age = candidate["allowed_age"]
         size_gb = candidate["size_gb"]
         seeders = int(meta.get("seeders") or 0)
         leechers = int(meta.get("leechers") or 0)
@@ -187,27 +198,28 @@ class BoxControllerV6(BoxControllerV5):
                 "score": 0,
                 "priority": 999,
                 "reason": (
-                    f"Race Lane：RSS 首次发现即入场，不等待 Leecher/需求比/评分；"
-                    f"入场 {age_seconds}s · {size_gb:.2f}GB · S/L={seeders}/{leechers}"
+                    f"Race Lane：命中分档直接入场，不等待 Leecher/需求比/评分；"
+                    f"入场 {age_seconds}s/{allowed_age}s · {size_gb:.2f}GB · S/L={seeders}/{leechers}"
                 ),
             }
             self._decision(state, row)
-            register_experiment(
-                state,
-                torrent_id=tid,
-                name=name,
-                strategy="race",
-                qbit_hash=qbit_hash,
-                added_at=int(time.time()),
-                size_gb=size_gb,
-                entry_age_seconds=age_seconds,
-                entry_seeders=seeders,
-                entry_leechers=leechers,
-                entry_score=0,
-            )
+            if cfg.get("experiment_enabled", True):
+                register_experiment(
+                    state,
+                    torrent_id=tid,
+                    name=name,
+                    strategy="race",
+                    qbit_hash=qbit_hash,
+                    added_at=int(time.time()),
+                    size_gb=size_gb,
+                    entry_age_seconds=age_seconds,
+                    entry_seeders=seeders,
+                    entry_leechers=leechers,
+                    entry_score=0,
+                )
             save_box_state(state)
             append_download_log(
-                f"Race Lane 秒冲 id={tid} age={age_seconds}s size={size_gb:.2f}GB S/L={seeders}/{leechers}",
+                f"Race Lane 秒冲 id={tid} age={age_seconds}/{allowed_age}s size={size_gb:.2f}GB S/L={seeders}/{leechers}",
                 action="box_add_race",
                 torrent_id=tid,
                 name=name,
@@ -224,6 +236,7 @@ class BoxControllerV6(BoxControllerV5):
                 "checked": probed,
                 "candidate": tid,
                 "age_seconds": age_seconds,
+                "allowed_age": allowed_age,
                 "size_gb": round(size_gb, 2),
             }
         except BoxApiBudgetError as e:
@@ -240,18 +253,10 @@ class BoxControllerV6(BoxControllerV5):
 
     def run_once(self) -> dict:
         cfg = load_box_config()
-
-        # 先记一帧旧任务，避免 cleanup 前最后一段上传成绩丢失。
         before_summary = self._collect_experiments(cfg)
-
-        # Race 必须排在资源等待队列/Trend 前面。先主动 cleanup 一次，让刚到 2.85 的旧种
-        # 释放下载空间，然后给“刚出生的新种”第一个下载槽。
         pre_race_cleanup = self.cleanup() if cfg.get("auto_cleanup") else {"deleted": []}
         race = self._try_race_lane(cfg)
-
-        # 继续跑 V5：资源等待队列 + 趋势确认车道 + 常规 cleanup。
         result = super().run_once()
-
         after_summary = self._collect_experiments(cfg)
         if isinstance(result, dict):
             result["race_lane"] = race
@@ -265,9 +270,22 @@ class BoxControllerV6(BoxControllerV5):
         state = load_box_state()
         out["race_lane"] = {
             "enabled": bool(cfg.get("race_lane_enabled", True)),
-            "max_age_seconds": int(cfg.get("race_max_age_seconds") or 180),
             "min_size_gb": float(cfg.get("race_min_size_gb") or 0.3),
-            "max_size_gb": float(cfg.get("race_max_size_gb") or 2.0),
+            "tiers": [
+                {
+                    "max_size_gb": float(cfg.get("race_tier1_max_size_gb") or 2.0),
+                    "max_age_seconds": int(cfg.get("race_tier1_max_age_seconds") or 180),
+                },
+                {
+                    "max_size_gb": float(cfg.get("race_tier2_max_size_gb") or 4.0),
+                    "max_age_seconds": int(cfg.get("race_tier2_max_age_seconds") or 150),
+                },
+                {
+                    "max_size_gb": float(cfg.get("race_tier3_max_size_gb") or 6.0),
+                    "max_age_seconds": int(cfg.get("race_tier3_max_age_seconds") or 90),
+                },
+            ],
+            "candidates_per_run": int(cfg.get("race_candidates_per_run") or 6),
         }
         out["experiment"] = experiment_summary(state.get("experiments") or {})
         return out
