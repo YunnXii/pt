@@ -10,7 +10,7 @@ _lock = Lock()
 DEFAULT_BOX_CONFIG = {
     "enabled": False,
     "rss_url": "",
-    "rss_poll_seconds": 45,
+    "rss_poll_seconds": 90,
     "qbit_url": "http://127.0.0.1:8080",
     "qbit_username": "admin",
     "qbit_password": "",
@@ -18,46 +18,57 @@ DEFAULT_BOX_CONFIG = {
     "qbit_category": "mteam-box",
     "download_dir": "/srv/torrents/downloads",
     "vnstat_interface": "eth0",
+
+    # Trend 车道基础范围与阈值。
     "min_size_gb": 0.3,
     "max_size_gb": 9.0,
-    # 软黄金窗口：超过后仍可被高需求/强趋势救回来。
     "max_age_seconds": 900,
-    # 绝对观察上限：超过才永久放弃。
     "hard_max_age_seconds": 3600,
     "min_leechers": 4,
-    # Seeder 仅作为竞争参考上限，不再直接永久拒绝。
     "max_seeders": 25,
     "min_demand": 0.5,
     "min_score": 65.0,
+
+    # Race Lane：按体积分档决定“无视 L/评分直接冲”的最大种龄。
+    "race_lane_enabled": True,
+    "race_min_size_gb": 0.3,
+    "race_tier1_max_size_gb": 2.0,
+    "race_tier1_max_age_seconds": 180,
+    "race_tier2_max_size_gb": 4.0,
+    "race_tier2_max_age_seconds": 150,
+    "race_tier3_max_size_gb": 6.0,
+    "race_tier3_max_age_seconds": 90,
+    "race_candidates_per_run": 6,
+
+    # 下载槽 / 磁盘 / 流量。
     "max_active_downloads": 1,
     "data_cap_gb": 16.0,
     "disk_reserve_gb": 4.0,
     "traffic_budget_gb": 1400.0,
     "traffic_hard_stop_gb": 1500.0,
     "billing_reset_day": 1,
-    # 盒子不再共用原项目 max_actions_per_hour=40；按 M-Team 接口单独留安全余量。
+
+    # 盒子独立 API 预算。
     "detail_limit_per_hour": 90,
     "download_limit_per_hour": 80,
+
+    # 自动清理与下载卡死。
     "auto_cleanup": True,
     "cleanup_ratio": 2.85,
     "cleanup_idle_minutes": 360,
     "cleanup_min_seed_minutes": 1440,
-    # 下载卡死清理：0B 僵尸更快清理；已有部分数据则给更长恢复时间。
     "cleanup_stalled_zero_minutes": 15,
     "cleanup_stalled_partial_minutes": 30,
-    # 资源等待队列：即使种子滚出 RSS，也会在空间/下载槽释放后重新评估。
+
+    # 资源等待队列。
     "resource_queue_recheck_seconds": 60,
     "resource_queue_checks_per_run": 3,
     "resource_queue_max_items": 120,
     "resource_queue_hard_max_age_seconds": 7200,
-    # Race Lane：小体积新种不等 Leecher，直接抢入场时间；与 trend 策略做真实对照。
-    "race_lane_enabled": True,
-    "race_max_age_seconds": 180,
-    "race_min_size_gb": 0.3,
-    "race_max_size_gb": 2.0,
-    "race_candidates_per_run": 3,
+
+    # 实验与扫描。
     "experiment_enabled": True,
-    "max_rss_items_per_run": 30,
+    "max_rss_items_per_run": 50,
 }
 
 DEFAULT_BOX_STATE = {
@@ -66,11 +77,8 @@ DEFAULT_BOX_STATE = {
     "rss_source_fp": "",
     "watch_retry_at": {},
     "torrent_observations": {},
-    # torrent id -> 等待原因/上次分数/下次复查时间；独立于 RSS 当前窗口持久化。
     "resource_wait_queue": {},
-    # hash -> downloaded / first_seen_at / last_progress_at，用于判断未完成下载是否真正停止推进。
     "download_progress_state": {},
-    # hash/torrent id -> race/trend 入场与 1/3/5/10 分钟战绩。
     "experiments": {},
     "traffic_cycle_key": "",
     "traffic_baseline_bytes": None,
@@ -123,10 +131,7 @@ def save_box_state(state: dict) -> dict:
     out["decisions"] = list(out.get("decisions") or [])[-120:]
 
     retry = out.get("watch_retry_at") or {}
-    if isinstance(retry, dict):
-        out["watch_retry_at"] = dict(list(retry.items())[-500:])
-    else:
-        out["watch_retry_at"] = {}
+    out["watch_retry_at"] = dict(list(retry.items())[-500:]) if isinstance(retry, dict) else {}
 
     observations = out.get("torrent_observations") or {}
     if isinstance(observations, dict):
@@ -175,29 +180,7 @@ def save_box_state(state: dict) -> dict:
 
     experiments = out.get("experiments") or {}
     if isinstance(experiments, dict):
-        compact_experiments = {}
-        for key, row in list(experiments.items())[-300:]:
-            if not isinstance(row, dict):
-                continue
-            milestones = row.get("milestones") or {}
-            compact_experiments[str(key)] = {
-                "torrent_id": str(row.get("torrent_id") or ""),
-                "qbit_hash": str(row.get("qbit_hash") or ""),
-                "name": str(row.get("name") or "")[:220],
-                "strategy": str(row.get("strategy") or "unknown"),
-                "added_at": int(row.get("added_at") or 0),
-                "size_gb": float(row.get("size_gb") or 0),
-                "entry_age_seconds": int(row.get("entry_age_seconds") or 0),
-                "entry_seeders": int(row.get("entry_seeders") or 0),
-                "entry_leechers": int(row.get("entry_leechers") or 0),
-                "entry_score": float(row.get("entry_score") or 0),
-                "milestones": {
-                    str(k): dict(v) for k, v in milestones.items()
-                    if str(k) in ("m1", "m3", "m5", "m10") and isinstance(v, dict)
-                },
-                "latest": dict(row.get("latest") or {}),
-            }
-        out["experiments"] = compact_experiments
+        out["experiments"] = dict(list(experiments.items())[-500:])
     else:
         out["experiments"] = {}
 
