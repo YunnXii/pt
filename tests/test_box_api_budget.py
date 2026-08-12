@@ -11,7 +11,7 @@ class BoxApiBudgetTests(unittest.TestCase):
         path.write_text('{"detail": [], "download": []}', encoding="utf-8")
 
     def test_rolling_window_usage_releases_old_calls(self):
-        usage = box_mteam.rolling_window_usage([1000, 1200, 1500], 3, now_ts=4501)
+        usage = box_mteam.rolling_window_usage([1000, 1200, 1500], 3, now_ts=5101)
         self.assertEqual(usage["used"], 0)
         self.assertEqual(usage["remaining"], 3)
 
