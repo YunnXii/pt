@@ -35,6 +35,9 @@ DEFAULT_BOX_CONFIG = {
     "traffic_budget_gb": 1400.0,
     "traffic_hard_stop_gb": 1500.0,
     "billing_reset_day": 1,
+    # 盒子不再共用原项目 max_actions_per_hour=40；按 M-Team 接口单独留安全余量。
+    "detail_limit_per_hour": 90,
+    "download_limit_per_hour": 80,
     "auto_cleanup": True,
     "cleanup_ratio": 2.85,
     "cleanup_idle_minutes": 360,
