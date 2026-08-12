@@ -1,0 +1,18 @@
+[Unit]
+Description=M-Team PT Box Controller
+After=network-online.target qbittorrent.service vnstat.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/mt-pt
+Environment=DATA_DIR=/opt/mt-pt/data
+Environment=DOWNLOAD_DIR=/opt/mt-pt/downloads
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/mt-pt/.venv/bin/uvicorn app.box_main:app --host 127.0.0.1 --port 8081
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
